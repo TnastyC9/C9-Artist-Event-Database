@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cloud 9 Artist Finder — v2</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/fuse.js@6.6.2"></script>
+  <style>
+    /* Micro-animations & flair */
+    @keyframes floaty { 0%,100% { transform: translateY(0) } 50% { transform: translateY(-4px) } }
+    .card { transition: transform .15s ease, box-shadow .15s ease, background .3s ease; }
+    .card:hover { transform: translateY(-2px); box-shadow: 0 6px 30px rgba(2,6,23,.12) }
+    .glass { backdrop-filter: blur(6px); background: rgba(255,255,255,.65) }
+    .preline { white-space: pre-line; }
+    .tbl-wrap { max-height: 70vh; overflow: auto; }
+    th, td { white-space: pre-line; }
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-sky-50 via-indigo-50 to-fuchsia-50 text-slate-900">
+  <!-- Header -->
+  <header class="relative border-b border-white/40">
+    <div class="absolute inset-0 pointer-events-none [mask-image:radial-gradient(60%_60%_at_50%_10%,#000,transparent)]">
+      <div class="h-40 bg-gradient-to-b from-white/70 to-transparent"></div>
+    </div>
+    <div class="max-w-6xl mx-auto p-6 relative">
+      <div class="flex items-start justify-between gap-6">
+        <div>
+          <h1 class="text-3xl md:text-4xl font-semibold tracking-tight">Cloud 9 Artist Finder</h1>
+          <p class="text-sm text-slate-600 mt-1">Search by <span class="font-semibold">Artist</span> or <span class="font-semibold">Event</span> — live from your Google Sheet.</p>
+        </div>
+        <a id="openSheet" target="_blank" class="inline-flex items-center gap-2 rounded-2xl px-4 py-2 bg-slate-900 text-white hover:bg-black shadow-sm">
+          <span>Open Sheet</span>
+          <span aria-hidden>↗</span>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main -->
+  <main class="max-w-6xl mx-auto px-6 pb-20">
+    <!-- Controls -->
+    <section class="grid gap-4 md:grid-cols-12 items-end mt-6">
+      <div class="md:col-span-9">
+        <div class="flex items-center gap-2 mb-2 text-xs text-slate-600">
+          <span>Mode:</span>
+          <div class="inline-flex rounded-xl border border-slate-300 bg-white p-1">
+            <button id="modeArtist" class="mode-btn rounded-lg px-3 py-1 text-xs font-medium bg-slate-900 text-white">Artist</button>
+            <button id="modeEvent" class="mode-btn rounded-lg px-3 py-1 text-xs font-medium hover:bg-slate-100">Event</button>
+          </div>
+        </div>
+        <label class="block text-xs font-medium text-slate-600 mb-1" for="q"><span id="qLabel">Search artist name</span></label>
+        <input id="q" type="text" placeholder="Type to search… (e.g., Stoopid, Stanton Moore, Bruce Hampton)" class="w-full rounded-2xl border border-slate-300 px-4 py-3 shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white" />
+      </div>
+      <div class="md:col-span-3 flex gap-2 justify-end">
+        <button id="resetBtn" class="rounded-2xl px-4 py-3 bg-white border border-slate-300 hover:bg-slate-50">Clear</button>
+      </div>
+    </section>
+
+    <section id="stats" class="mt-4 text-sm text-slate-600 hidden"></section>
+
+    <!-- Default full table -->
+    <section id="tableWrap" class="mt-6 tbl-wrap">
+      <div class="rounded-2xl overflow-hidden ring-1 ring-slate-200 shadow-sm bg-white">
+        <table class="min-w-full bg-white">
+          <thead class="bg-slate-50/80 text-left text-sm sticky top-0 z-10 backdrop-blur">
+            <tr id="theadRow"></tr>
+          </thead>
+          <tbody id="tbody" class="text-sm"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Grouped results while typing -->
+    <section id="results" class="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3 hidden"></section>
+  </main>
+
+  <footer class="text-center text-xs text-slate-500 pb-10">Powered by Google Sheets · GitHub Pages ready</footer>
+
+  <script>
+    /*** CONFIG ***/
+    const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTEDQWPOZAmYdi7gul8fgLDKsTC3uWwXNAvIUuej0aVcXyvwu6T2GJu3IAmWUrSS2zMbaVkNzScwMIi/pub?gid=1307589284&single=true&output=csv";
+    const SHEET_URL = "https://docs.google.com/spreadsheets/d/1CmgtUYn8xoUUpDebAyJcuf8f1oM9a2WXKrSkHrOaqFI/edit?usp=sharing";
+
+    // Preferred header names (case-insensitive)
+    const PREFERRED_COLS = { artist: 'Artist Name', events: 'Event(s)', years: 'Year(s) Performed' };
+
+    /*** DOM helpers ***/
+    const $ = id => document.getElementById(id);
+    const resultsEl = $("results");
+    const statsEl = $("stats");
+    const tableWrap = $("tableWrap");
+    const theadRow = $("theadRow");
+    const tbody = $("tbody");
+    const modeArtistBtn = $("modeArtist");
+    const modeEventBtn = $("modeEvent");
+    const qInput = $("q");
+    const qLabel = $("qLabel");
+
+    /*** CSV + parsing ***/
+    function csvToRows(text){
+      const out=[], row=[]; let cur='', q=false;
+      for(let i=0;i<text.length;i++){
+        const c=text[i],n=text[i+1];
+        if(c==='\uFEFF') continue; // strip BOM
+        if(c==='"'){ if(q && n==='"'){cur+='"'; i++;} else {q=!q;} }
+        else if(c===','&&!q){row.push(cur);cur='';}
+        else if((c==='\n'||c==='\r')&&!q){ if(c==='\r'&&n==='\n'){i++;} row.push(cur); out.push(row.slice()); row.length=0; cur=''; }
+        else{cur+=c;}
+      }
+      if(cur.length||row.length){row.push(cur);out.push(row);} return out;
+    }
+
+    // pick the row that most looks like a header within the first 6 rows
+    function detectHeaderRow(rows){
+      const need = ['artist','event','year'];
+      let best = 0, scoreBest = -1;
+      const limit = Math.min(6, rows.length);
+      for(let r=0;r<limit;r++){
+        const lower = rows[r].map(c => (c||'').toString().toLowerCase());
+        let score = 0; lower.forEach(c => need.forEach(n=>{ if(c.includes(n)) score++; }));
+        if(score > scoreBest){ scoreBest = score; best = r; }
+      }
+      return best;
+    }
+
+    const norm  = s => (s||'').toString().toLowerCase();
+    const strip = s => (s||'').toString().trim();
+    const extractYears = s => ((s||'').match(/\b(19\d{2}|20\d{2})\b/g)||[]).map(x=>+x);
+
+    function bestHeaderIndex(headers, wanted){
+      const target = wanted.toLowerCase();
+      let i = headers.indexOf(target); if(i!==-1) return i;
+      // try contains
+      const tokens = target.includes('artist')? ['artist'] : target.includes('event')? ['event'] : ['year'];
+      for(let j=0;j<headers.length;j++){ if(tokens.some(t => headers[j].includes(t))) return j; }
+      return -1;
+    }
+
+    function groupByArtist(rows, idx){
+      const map = new Map();
+      rows.forEach(r=>{ const key = strip(r[idx.artist]); if(!key) return; if(!map.has(key)) map.set(key, []); map.get(key).push(r); });
+      return map;
+    }
+
+    /*** State ***/
+    let ALL_ROWS=[]; let IDX={}; let RAW_HEADERS=[];
+    let FUSE_ARTIST=null, FUSE_EVENT=null;
+    let MODE = 'artist'; // 'artist' | 'event'
+
+    async function load(){
+      $("openSheet").href = SHEET_URL;
+      const res = await fetch(CSV_URL);
+      const text = await res.text();
+      const rows = csvToRows(text);
+      if(!rows.length){ resultsEl.innerHTML = '<div class="text-red-600">Could not load CSV.</div>'; return; }
+
+      const headerRow = detectHeaderRow(rows);
+      RAW_HEADERS = rows[headerRow].map(h=>strip(h));
+      const headers = RAW_HEADERS.map(h=>h.toLowerCase());
+
+      const aIdx = bestHeaderIndex(headers, PREFERRED_COLS.artist);
+      const eIdx = bestHeaderIndex(headers, PREFERRED_COLS.events);
+      const yIdx = bestHeaderIndex(headers, PREFERRED_COLS.years);
+      IDX = { artist: aIdx, events: eIdx, years: yIdx };
+
+      if(Object.values(IDX).some(v => v < 0)){
+        resultsEl.innerHTML = '<div class="text-red-600">Header detection failed. Ensure columns: Artist Name, Event(s), Year(s) Performed.</div>';
+        return;
+      }
+
+      ALL_ROWS = rows.slice(headerRow+1).filter(r => strip(r[IDX.artist]) !== '');
+      // sort by artist for nicer default view
+      ALL_ROWS.sort((a,b)=> strip(a[IDX.artist]).localeCompare(strip(b[IDX.artist])) );
+
+      // fuzzy indices
+      FUSE_ARTIST = new Fuse(ALL_ROWS.map((r,i)=>({ i, key: r[IDX.artist]||'' })), { includeScore:true, threshold:0.3, keys:['key'] });
+      FUSE_EVENT  = new Fuse(ALL_ROWS.map((r,i)=>({ i, key: r[IDX.events]||'' })), { includeScore:true, threshold:0.3, keys:['key'] });
+
+      buildFullTable(RAW_HEADERS, ALL_ROWS);
+      // show table by default
+      tableWrap.classList.remove('hidden');
+      resultsEl.classList.add('hidden');
+      statsEl.classList.add('hidden');
+    }
+
+    function buildFullTable(headers, rows){
+      theadRow.innerHTML = '';
+      headers.forEach(h=>{
+        const th = document.createElement('th');
+        th.className = 'px-3 py-2 border-b border-slate-200';
+        th.textContent = h;
+        theadRow.appendChild(th);
+      });
+
+      tbody.innerHTML = '';
+      rows.forEach(r=>{
+        const tr = document.createElement('tr');
+        tr.className = 'odd:bg-white even:bg-slate-50/40';
+        headers.forEach((_,j)=>{
+          const td = document.createElement('td');
+          td.className = 'px-3 py-2 border-b border-slate-100 align-top';
+          td.textContent = strip(r[j]||'');
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+    }
+
+    function renderGrouped(groups){
+      resultsEl.innerHTML=''; let total=0;
+      groups.forEach((rows, artist)=>{
+        const blocks = rows.map(r=>{
+          const ev = strip(r[IDX.events]||'');
+          const yrs = strip(r[IDX.years]||'');
+          return `${ev}\n${yrs}`;
+        }).join('\n\n');
+        total += rows.length;
+        const yrsAll = Array.from(new Set(rows.flatMap(r=>extractYears(r[IDX.years])))).sort((a,b)=>a-b);
+        const span = yrsAll.length? `${yrsAll[0]}–${yrsAll[yrsAll.length-1]}`: '';
+        const card = document.createElement('div');
+        card.className = 'card rounded-2xl glass border border-white/60 p-4 shadow-sm hover:shadow-lg';
+        card.innerHTML = `
+          <div class="flex items-start justify-between gap-4">
+            <div>
+              <h3 class="text-lg font-semibold">${artist}</h3>
+              ${span?`<div class="text-xs text-slate-600 mt-1">Years span: ${span}</div>`:''}
+            </div>
+            <div class="text-xl select-none" aria-hidden>🎟️</div>
+          </div>
+          <pre class="preline mt-3 text-sm">${blocks}</pre>`;
+        resultsEl.appendChild(card);
+      });
+      statsEl.classList.toggle('hidden', groups.size===0);
+      if(groups.size){ statsEl.textContent = `${groups.size} artist${groups.size!==1?'s':''} · ${total} record${total!==1?'s':''}`; }
+    }
+
+    function doArtistSearch(q){
+      // substring on artist, fuzzy fallback
+      const qn = norm(q);
+      const matches = new Set();
+      ALL_ROWS.forEach((r,i)=>{ if(norm(r[IDX.artist]).includes(qn)) matches.add(i); });
+      if(matches.size===0){ FUSE_ARTIST.search(q).slice(0,50).forEach(h=>matches.add(h.item.i)); }
+      const rows = Array.from(matches).map(i=>ALL_ROWS[i]);
+      const groups = groupByArtist(rows, IDX);
+      renderGrouped(groups);
+      return rows.length;
+    }
+
+    function doEventSearch(q){
+      const qn = norm(q);
+      const matches = new Set();
+      ALL_ROWS.forEach((r,i)=>{ if(norm(r[IDX.events]).includes(qn)) matches.add(i); });
+      if(matches.size===0){ FUSE_EVENT.search(q).slice(0,100).forEach(h=>matches.add(h.item.i)); }
+      const rows = Array.from(matches).map(i=>ALL_ROWS[i]);
+      const groups = groupByArtist(rows, IDX); // group by artist (show everyone who has that event)
+      renderGrouped(groups);
+      return rows.length;
+    }
+
+    function search(){
+      const q = $("q").value.trim();
+      if(!q){
+        // Show full table
+        resultsEl.classList.add('hidden');
+        tableWrap.classList.remove('hidden');
+        statsEl.classList.add('hidden');
+        return;
+      }
+      tableWrap.classList.add('hidden');
+      resultsEl.classList.remove('hidden');
+      const count = MODE === 'artist' ? doArtistSearch(q) : doEventSearch(q);
+      statsEl.classList.toggle('hidden', count===0);
+    }
+
+    // Mode switching
+    function setMode(m){
+      MODE = m;
+      const isArtist = m === 'artist';
+      modeArtistBtn.className = 'mode-btn rounded-lg px-3 py-1 text-xs font-medium ' + (isArtist ? 'bg-slate-900 text-white' : 'hover:bg-slate-100');
+      modeEventBtn.className  = 'mode-btn rounded-lg px-3 py-1 text-xs font-medium ' + (!isArtist ? 'bg-slate-900 text-white' : 'hover:bg-slate-100');
+      qLabel.textContent = isArtist ? 'Search artist name' : 'Search event name';
+      qInput.placeholder = isArtist
+        ? 'Type to search… (e.g., Stoopid, Stanton Moore, Bruce Hampton)'
+        : 'Type to search… (e.g., Jam Cruise, Closer to the Sun, Strings & Sol)';
+      qInput.focus();
+      // Re-run current query in new mode
+      if(qInput.value.trim()) search();
+    }
+
+    let t=null;
+    qInput.addEventListener('input', ()=>{ clearTimeout(t); t=setTimeout(search,150); });
+    $("resetBtn").addEventListener('click', ()=>{ qInput.value=''; search(); });
+    modeArtistBtn.addEventListener('click', ()=> setMode('artist'));
+    modeEventBtn.addEventListener('click',  ()=> setMode('event'));
+
+    load().catch(err=>{ resultsEl.innerHTML = `<div class="text-red-600">Error: ${err.message}</div>`; });
+  </script>
+</body>
+</html>
